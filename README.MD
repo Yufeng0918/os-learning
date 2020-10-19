@@ -223,3 +223,40 @@ rest_init 的第一工作是用 kernel_thread(kernel_init, NULL, CLONE_FS) 创�
 用户态（User Mode）: 普通的程序代码放在 Ring3
 
 ![](./images/os-14.png)
+
+### 2.4 系统调用
+
+#### 32位系统调用
+
++ 将请求参数放在寄存器里面
++ 根据系统调用名称，得到系统调用号，放在寄存器 eax 里面
++ 执行 ENTER_KERNEL
++ 从 eax 里面取出来系统调用号，然后根据系统调用号，在系统调用表sys_call_table中找到相应的函数进行调用，并将寄存器中保存的参数取出来，作为函数参数
++ iret 指令将原来用户态保存的现场恢复回来
+
+![](./images/os-15.png)
+
+#### 64位系统调用
+
++ 将请求参数放在寄存器里面
++ 根据系统调用名称，得到系统调用号，放在寄存器 eax 里面
++ 执行 syscall 进入内核， syscall是特殊模块寄存器，为CPU执行系统调用
++ 从rax 里面拿出系统调用号，然后根据系统调用号，在系统调用表 sys_call_table 中找到相应的函数进行调用，并将寄存器中保存的参数取出来，作为函数参数
++ sysretq 指令将原来用户态保存的现场恢复回来
+
+![](./images/os-16.png)
+
+#### 系统调用表
+
+32 位的系统调用表定义在 arch/x86/entry/syscalls/syscall_32.tbl 文件里
+
+64 位的系统调用定义在另一个文件 arch/x86/entry/syscalls/syscall_64.tbl 里
+
++ 第一列的数字是系统调用号
++ 第三列是系统调用的名字
++ 第四列是系统调用在内核的实现函数。
+
+```assembly
+2  common  open      sys_open
+```
+
