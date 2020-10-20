@@ -260,3 +260,6 @@ rest_init 的第一工作是用 kernel_thread(kernel_init, NULL, CLONE_FS) 创�
 2  common  open      sys_open
 ```
 
+
+
+## 3. 进程管理
