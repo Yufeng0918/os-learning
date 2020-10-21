@@ -263,3 +263,143 @@ rest_init 的第一工作是用 kernel_thread(kernel_init, NULL, CLONE_FS) 创�
 
 
 ## 3. 进程管理
+
+### 3.1 进程代码
+
+process.c
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+extern int create_process (char* program, char** arg_list);
+
+int create_process (char* program, char** arg_list) {
+    pid_t child_pid;
+    child_pid = fork ();
+    if (child_pid != 0)
+        return child_pid;
+    else {
+        execvp (program, arg_list);
+        abort ();
+    }
+}
+```
+
+createprocess.c
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <unistd.h>
+extern int create_process (char* program, char** arg_list);
+
+int main () {
+    char* arg_list[] = {
+        "ls",
+        "-l",
+        "/etc/yum.repos.d/",
+        NULL
+    };
+    create_process ("ls", arg_list);
+    return 0;
+}
+```
+
+
+
+### 3.2 ELF 程序的二进制格式
+
+源代码被编译成二进制文件，这个格式称为 ELF（Executeable and Linkable Format，可执行与可链接格式）。
+
+![](./images/os-17.png)
+
+#### 可重定位文件
+
+![](./images/os-18.png)
+
+ELF 文件的头是用于描述整个文件的
+
++ .text：放编译好的二进制可执行代码
++ .data：已经初始化好的全局变量
++ .rodata：只读数据，例如字符串常量、const 的变量
++ .bss：未初始化全局变量，运行时会置 0
++ .symtab：符号表，记录的则是函数和变量
++ .strtab：字符串表、字符串常量和变量名
+
+编译好的代码和变量，将来加载到内存里面的时候，都是要加载到一定位置的。**.o 文件，不是一个可以直接运行的程序**，这里面只是部分代码片段。**create_process 函数不确定位置，需要可以重新定位代码片段。**.rel.text, .rel.data 就与重定位有关。
+
+
+
+#### 可执行文件 - 静态链接
+
+![](./images/os-19.png)
+
+把process.o创建成静态链接库。**静态链接库一旦链接进去，代码和变量的 section 都合并了**，因而程序运行的时候，就不依赖于这个库是否存在
+
+```shell
+ar cr libstaticprocess.a process.o
+gcc -o staticcreateprocess createprocess.o -L. -libstaticprocess
+```
+
+
+
+#### 共享对象文件 - 动态链接
+
+动态链接库（Shared Libraries）是多个对象文件的重新组合，可被多个程序共享。当运行这个程序的时候，首先寻找动态链接库，然后加载它。默认情况下，系统在 **/lib， /usr/lib 和 LD_LIBRARY_PATH 环境变量**
+
+```SHELL
+gcc -shared -fPIC -o libdynamicprocess.so process.o
+gcc -o dynamiccreateprocess createprocess.o -L. -ldynamicprocess
+```
+
++ 多了一个.interp 的 Segment，这里面是 **ld-linux.so，这是动态链接器**，运行时的链接动作都是它做的
++ ELF 文件中还多了两个 section
+  + 一个是.plt，过程链接表（Procedure Linkage Table，PLT）
+  + 一个是.got.plt，全局偏移量表（Global Offset Table，GOT）
+
+**调用过程**
+
++ PLT 里面建立一项 PLT[x]。本地的代理，在二进制程序里面，不直接调用 create_process 函数，而是调用 PLT[x]里面的代理代码，这个代理代码会在运行的时候找真正的 create_process 函数
++ GOT[y]一项是运行时 create_process 函数在内存中真正的地址
++ GOT[y]没有真正的地址，它又回调 PLT
++ PLT 这个时候会转而调用 PLT[0]，PLT[0]转而调用 GOT[2]，这里面是 ld-linux.so 的入口函数
+
+
+
+### 3.3 内核数据结构
+
+在内核中，linux_binfmt数据结构定义加载二进制文件的方法
+
+```c
+struct linux_binfmt {
+        struct list_head lh;
+        struct module *module;
+        int (*load_binary)(struct linux_binprm *);
+        int (*load_shlib)(struct file *);
+        int (*core_dump)(struct coredump_params *cprm);
+        unsigned long min_coredump;     /* minimal dump size */
+} __randomize_layout;
+```
+
+```c
+static struct linux_binfmt elf_format = {
+        .module         = THIS_MODULE,
+        .load_binary    = load_elf_binary,
+        .load_shlib     = load_elf_library,
+        .core_dump      = elf_core_dump,
+        .min_coredump   = ELF_EXEC_PAGESIZE,
+};
+```
+
+
+
+### 3.4 进程树
+
+![](./images/os-20.png)
+
+### 3.5 总结
+
+![](./images/os-21.png)
