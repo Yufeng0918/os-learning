@@ -264,7 +264,9 @@ rest_init 的第一工作是用 kernel_thread(kernel_init, NULL, CLONE_FS) 创�
 
 ## 3. 进程管理
 
-### 3.1 进程代码
+### 3.1 进程
+
+#### 进程代码
 
 process.c
 
@@ -310,13 +312,13 @@ int main () {
 
 
 
-### 3.2 ELF 程序的二进制格式
+#### ELF 程序的二进制格式
 
 源代码被编译成二进制文件，这个格式称为 ELF（Executeable and Linkable Format，可执行与可链接格式）。
 
 ![](./images/os-17.png)
 
-#### 可重定位文件
+##### 可重定位文件
 
 ![](./images/os-18.png)
 
@@ -333,7 +335,7 @@ ELF 文件的头是用于描述整个文件的
 
 
 
-#### 可执行文件 - 静态链接
+##### 可执行文件 - 静态链接
 
 ![](./images/os-19.png)
 
@@ -344,9 +346,7 @@ ar cr libstaticprocess.a process.o
 gcc -o staticcreateprocess createprocess.o -L. -libstaticprocess
 ```
 
-
-
-#### 共享对象文件 - 动态链接
+##### 共享对象文件 - 动态链接
 
 动态链接库（Shared Libraries）是多个对象文件的重新组合，可被多个程序共享。当运行这个程序的时候，首先寻找动态链接库，然后加载它。默认情况下，系统在 **/lib， /usr/lib 和 LD_LIBRARY_PATH 环境变量**
 
@@ -369,7 +369,7 @@ gcc -o dynamiccreateprocess createprocess.o -L. -ldynamicprocess
 
 
 
-### 3.3 内核数据结构
+#### 内核数据结构
 
 在内核中，linux_binfmt数据结构定义加载二进制文件的方法
 
@@ -396,10 +396,194 @@ static struct linux_binfmt elf_format = {
 
 
 
-### 3.4 进程树
+#### 进程树
 
 ![](./images/os-20.png)
 
-### 3.5 总结
+#### 总结
 
 ![](./images/os-21.png)
+
+### 3.2 线程
+
+#### 创建线程
+
+```c
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define NUM_OF_TASKS 5
+
+void *downloadfile(void *filename)
+{
+   printf("I am downloading the file %s!\n", (char *)filename);
+   sleep(10);
+   long downloadtime = rand()%100;
+   printf("I finish downloading the file within %d minutes!\n", downloadtime);
+   pthread_exit((void *)downloadtime);
+}
+
+int main(int argc, char *argv[])
+{
+   char files[NUM_OF_TASKS][20]={"file1.avi","file2.rmvb","file3.mp4","file4.wmv","file5.flv"};
+   pthread_t threads[NUM_OF_TASKS];
+   int rc;
+   int t;
+   int downloadtime;
+	 
+   // 声明线程属性 
+   pthread_attr_t thread_attr;
+   // 初始化线程属性
+   pthread_attr_init(&thread_attr);
+   pthread_attr_setdetachstate(&thread_attr,PTHREAD_CREATE_JOINABLE);
+
+   for(t=0;t<NUM_OF_TASKS;t++){
+     printf("creating thread %d, please help me to download %s\n", t, files[t]);
+     
+     // 创建线程
+     // 第一个参数：线程对象
+     // 第二个参数：线程属性
+     // 第三个参数：线程执行的方法
+     // 第四个参数：线程执行的方法的参数
+     rc = pthread_create(&threads[t], &thread_attr, downloadfile, (void *)files[t]);
+     if (rc){
+       printf("ERROR; return code from pthread_create() is %d\n", rc);
+       exit(-1);
+     }
+   }
+
+   pthread_attr_destroy(&thread_attr);
+
+   for(t=0;t<NUM_OF_TASKS;t++){
+     pthread_join(threads[t],(void**)&downloadtime);
+     printf("Thread %d downloads the file %s in %d minutes.\n",t,files[t],downloadtime);
+   }
+
+   pthread_exit(NULL);
+}
+```
+
+![](./images/os-22.png)
+
+#### 线程数据
+
++ 线程栈上的本地数据
++ 整个进程里共享的全局数据
++ 线程私有数据（Thread Specific Data）: key 一旦被创建，所有线程都可以访问它，**但各线程可根据自己的需要往 key 中填入不同的值**，这就相当于提供了一个同名而不同值的全局变量。
+
+```C
+
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void*))
+int pthread_setspecific(pthread_key_t key, const void *value)
+void *pthread_getspecific(pthread_key_t key)
+```
+
+#### 数据保护
+
+操作共享资源的时候，还是需要抢互斥锁，因为可能很多人都受到了通知，都来访问了，所以条件变量和互斥锁是配合使用的。
+
++ Mutex，首先要使用 pthread_mutex_init 函数初始化这个 mutex
++ pthread_mutex_lock() 是去抢那把锁的函数，
+  + 如果抢到了就可以执行下一行程序，对共享变量进行访问
+  + 如果没抢到，就被阻塞在那里等待。
++ pthread_mutex_unlock 释放锁
++ 最终调用 pthread_mutex_destroy 销毁掉这把锁。
+
+![](./images/os-23.png)
+
+```C
+
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define NUM_OF_TASKS 3
+#define MAX_TASK_QUEUE 11
+
+char tasklist[MAX_TASK_QUEUE]="ABCDEFGHIJ";
+int head = 0;
+int tail = 0;
+
+int quit = 0;
+
+pthread_mutex_t g_task_lock;
+pthread_cond_t g_task_cv;
+
+// 消费者代码
+void *coder(void *notused)
+{
+  pthread_t tid = pthread_self();
+
+  while(!quit){
+		// 获取mutex lock
+    pthread_mutex_lock(&g_task_lock);
+    while(tail == head){
+      if(quit){
+        pthread_mutex_unlock(&g_task_lock);
+        pthread_exit((void *)0);
+      }
+      printf("No task now! Thread %u is waiting!\n", (unsigned int)tid);
+      // 持续检查任务队列是否为空，如果为空就继续等待，等待的时候会释放锁
+      pthread_cond_wait(&g_task_cv, &g_task_lock);
+      printf("Have task now! Thread %u is grabing the task !\n", (unsigned int)tid);
+    }
+    
+    // 执行一下代码如果任务队列不为空，操作共享变量
+    char task = tasklist[head++];
+    // 释放锁
+    pthread_mutex_unlock(&g_task_lock);
+    printf("Thread %u has a task %c now!\n", (unsigned int)tid, task);
+    sleep(5);
+    printf("Thread %u finish the task %c!\n", (unsigned int)tid, task);
+  }
+
+  pthread_exit((void *)0);
+}
+
+int main(int argc, char *argv[])
+{
+  pthread_t threads[NUM_OF_TASKS];
+  int rc;
+  int t;
+
+  pthread_mutex_init(&g_task_lock, NULL);
+  pthread_cond_init(&g_task_cv, NULL);
+
+  for(t=0;t<NUM_OF_TASKS;t++){
+    rc = pthread_create(&threads[t], NULL, coder, NULL);
+    if (rc){
+      printf("ERROR; return code from pthread_create() is %d\n", rc);
+      exit(-1);
+    }
+  }
+
+  sleep(5);
+
+  for(t=1;t<=4;t++){
+    pthread_mutex_lock(&g_task_lock);
+    tail+=t;
+    printf("I am Boss, I assigned %d tasks, I notify all coders!\n", t);
+    //唤醒所有线程
+    pthread_cond_broadcast(&g_task_cv);
+    pthread_mutex_unlock(&g_task_lock);
+    sleep(20);
+  }
+
+  pthread_mutex_lock(&g_task_lock);
+  quit = 1;
+  pthread_cond_broadcast(&g_task_cv);
+  pthread_mutex_unlock(&g_task_lock);
+
+  pthread_mutex_destroy(&g_task_lock);
+  pthread_cond_destroy(&g_task_cv);
+  pthread_exit(NULL);
+}
+```
+
+![](./images/os-24.png)
+
+#### 总结
+
+![](./images/os-25.png)
