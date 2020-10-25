@@ -743,3 +743,84 @@ struct cred {
 + **cap_bset** 是 capability bounding set，是系统中所有进程允许保留的权限。如果这个集合中不存在某个权限，那么系统中的所有进程都没有这个权限
 + **cap_ambient** 非 root 用户进程使用 exec 执行一个程序的时候，如何保留权限的问题。当执行 exec 的时候，cap_ambient 会被添加到 cap_permitted 中，同时设置到 cap_effective 中
 
+
+
+#### 用户态函数栈
+
+##### 32 位操作系统
+
++ ESP（Extended Stack Pointer）是栈顶指针寄存器，入栈操作 Push 和出栈操作 Pop 指令，会自动调整 ESP
++ EBP（Extended Base Pointer），是栈基地址指针寄存器
++ 参数压入栈顶
++ 返回值会保存在 EAX 寄存器中
+
+![](./images/os-29.png)
+
+##### 64 位操作系统
+
++ RSP 是栈顶指针寄存器，入栈操作 Push 和出栈操作 Pop 指令，会自动调整 ESP
++ RBP是栈基地址指针寄存器
++ rdi、rsi、rdx、rcx、r8、r9 这 6 个寄存器用于传递存储函数调用时的 6 个参数。如果超过 6 的时候，还是需要放到栈里面。
+
+![](./images/os-30.png)
+
+#### 内核态函数栈
+
+这段空间的最低位置，是一个 thread_info 结构。这个结构是对 task_struct 结构的补充。因为 task_struct 结构庞大但是通用，不同的体系结构就需要保存不同的东西，所以往往与体系结构有关的，都放在 thread_info 里面。
+
+![](./images/os-31.png)
+
+```C
+/*
+ * TOP_OF_KERNEL_STACK_PADDING reserves 8 bytes on top of the ring0 stack.
+ * This is necessary to guarantee that the entire "struct pt_regs"
+ * is accessible even if the CPU haven't stored the SS/ESP registers
+ * on the stack (interrupt gate does not save these registers
+ * when switching to the same priv ring).
+ * Therefore beware: accessing the ss/esp fields of the
+ * "struct pt_regs" is possible, but they may contain the
+ * completely wrong values.
+ */
+#define task_pt_regs(task) \
+({                  \
+  unsigned long __ptr = (unsigned long)task_stack_page(task);  \
+  __ptr += THREAD_SIZE - TOP_OF_KERNEL_STACK_PADDING;    \
+  ((struct pt_regs *)__ptr) - 1;          \
+})
+```
+
+先从 task_struct 找到内核栈的开始位置。然后这个位置加上 THREAD_SIZE 就到了最后的位置，然后转换为 struct pt_regs，再减一，就相当于减少了一个 pt_regs 的位置，就到了这个结构的首地址
+
+```C
+#ifdef CONFIG_X86_32
+# ifdef CONFIG_VM86
+#  define TOP_OF_KERNEL_STACK_PADDING 16
+# else
+#  define TOP_OF_KERNEL_STACK_PADDING 8
+# endif
+#else
+# define TOP_OF_KERNEL_STACK_PADDING 0
+#endif
+```
+
+
+
+thread_info中有成员变量 task 指向 task_struct， 常用 current_thread_info()->task 来获取 task_struct。
+
+```C
+struct thread_info {
+  struct task_struct  *task;    /* main task structure */
+  __u32      flags;    /* low level flags */
+  __u32      status;    /* thread synchronous flags */
+  __u32      cpu;    /* current CPU */
+  mm_segment_t    addr_limit;
+  unsigned int    sig_on_uaccess_error:1;
+  unsigned int    uaccess_err:1;  /* uaccess failed */
+};
+
+static inline struct thread_info *current_thread_info(void)
+{
+  return (struct thread_info *)(current_top_of_stack() - THREAD_SIZE);
+}
+```
+
