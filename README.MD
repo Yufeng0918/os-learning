@@ -587,3 +587,159 @@ int main(int argc, char *argv[])
 #### 总结
 
 ![](./images/os-25.png)
+
+
+
+### 3.3 任务结构
+
+Linux 里面，无论是进程，还是线程，到了内核里面，我们统一都叫任务（Task），由一个统一的结构 task_struct 进行管理。
+
+**进程**，那 pid 是自己，tgid 是自己，group_leader 指向的还是自己
+
+**线程**，那 pid 是自己，tgid 就是进程的主线程的 pid，group_leader 指向的就是进程的主线程。
+
+#### 信号处理
+
+```C
+/* Signal handlers: */
+struct signal_struct    *signal;
+struct sighand_struct    *sighand;
+sigset_t      blocked;
+sigset_t      real_blocked;
+sigset_t      saved_sigmask;
+struct sigpending    pending;
+unsigned long      sas_ss_sp;
+size_t        sas_ss_size;
+unsigned int      sas_ss_flags;
+```
+
++ blocked: 信号被阻塞暂不处理
++ pending: 信号尚等待处理
++ sighand: 正在通过信号处理函数进行处理
+
+
+
+#### 任务状态
+
+![](./images/os-26.png)
+
++ **TASK_RUNNING**： 并不是说进程正在运行，而是表示进程在时刻准备运行的状态
++ **TASK_INTERRUPTIBLE**：可中断的睡眠状态，信号可以唤醒进程
++ **TASK_UNINTERRUPTIBLE**：不可中断的睡眠状态，线程不能被唤醒
++ **TASK_KILLABLE**：可以终止的新睡眠状态，可以响应致命信号
++ **TASK_STOPPED**：进程接收到 SIGSTOP、SIGTTIN、SIGTSTP 或者 SIGTTOU 信号之后进入该状态
++ **TASK_TRACED**：进程被 debugger 等进程监视，进程执行被调试程序所停止
++ **EXIT_ZOMBIE**：进程要结束
++ **EXIT_DEAD**：最终状态
+
+
+
+#### 其他状态标志
+
+```C
+#define PF_EXITING    0x00000004
+#define PF_VCPU      0x00000010
+#define PF_FORKNOEXEC    0x00000040
+```
+
++ PF_EXITING 表示正在退出
++ PF_VCPU 表示进程运行在虚拟 CPU 上
++ PF_FORKNOEXEC 表示 fork 完了，还没有 exec。
+
+
+
+#### 运行统计信息
+
+```C
+u64        utime;//用户态消耗的CPU时间
+u64        stime;//内核态消耗的CPU时间
+unsigned long      nvcsw;//自愿(voluntary)上下文切换计数
+unsigned long      nivcsw;//非自愿(involuntary)上下文切换计数
+u64        start_time;//进程启动时间，不包含睡眠时间
+u64        real_start_time;//进程启动时间，包含睡眠时间
+```
+
+
+
+#### 亲缘关系
+
+```C
+struct task_struct __rcu *real_parent; /* real parent process */
+struct task_struct __rcu *parent; /* recipient of SIGCHLD, wait4() reports */
+struct list_head children;      /* list of my children */
+struct list_head sibling;       /* linkage in my parent's children list */
+```
+
++ parent 指向其父进程。当它终止时，必须向它的父进程发送信号
++ children 表示链表的头部。链表中的所有元素都是它的子进程
++ sibling 用于把当前进程插入到兄弟链表中。
+
+![](./images/os-27.png)
+
+#### 权限控制
+
+```C
+/* Objective and real subjective task credentials (COW): */
+const struct cred __rcu         *real_cred;
+/* Effective (overridable) subjective task credentials (COW): */
+const struct cred __rcu         *cred;
+```
+
++ real_cred 就是说明谁能操作我这个进程
++ cred 就是说明我这个进程能够操作谁
+
+```C
+
+struct cred {
+......
+        kuid_t          uid;            /* real UID of the task */
+        kgid_t          gid;            /* real GID of the task */
+        kuid_t          suid;           /* saved UID of the task */
+        kgid_t          sgid;           /* saved GID of the task */
+        kuid_t          euid;           /* effective UID of the task */
+        kgid_t          egid;           /* effective GID of the task */
+        kuid_t          fsuid;          /* UID for VFS ops */
+        kgid_t          fsgid;          /* GID for VFS ops */
+......
+        kernel_cap_t    cap_inheritable; /* caps our children can inherit */
+        kernel_cap_t    cap_permitted;  /* caps we're permitted */
+        kernel_cap_t    cap_effective;  /* caps we can actually use */
+        kernel_cap_t    cap_bset;       /* capability bounding set */
+        kernel_cap_t    cap_ambient;    /* Ambient capability set */
+......
+} __randomize_layout;
+```
+
+
+
+##### 用户和用户组权限
+
++ euid/egid，是 effective user/group id。当这个进程要操作消息队列、共享内存、信号量等对象的时候，其实就是在比较这个用户和组是否有权限。
++ fsuid/fsgid，是 filesystem user/group id。这个是对文件操作会审核的权限。
+
+
+
+可以通过 chmod u+s program 命令，给这个游戏程序设置 set-user-ID 的标识位，把游戏的权限变成 rwsr-xr-x。这个时候，用户 A 再启动这个游戏的时候，创建的进程 uid 当然还是用户 A，但是 euid 和 fsuid 就不是用户 A 了，因为看到了 set-user-id 标识，**就改为文件的所有者的 ID，也就是说，euid 和 fsuid 都改成用户 B 了**。
+
+![](./images/os-28.png)
+
+##### capabilities
+
+```C
+#define CAP_CHOWN            0
+#define CAP_KILL             5
+#define CAP_NET_BIND_SERVICE 10
+#define CAP_NET_RAW          13
+#define CAP_SYS_MODULE       16
+#define CAP_SYS_RAWIO        17
+#define CAP_SYS_BOOT         22
+#define CAP_SYS_TIME         25
+#define CAP_AUDIT_READ          37
+#define CAP_LAST_CAP         CAP_AUDIT_READ
+```
+
++ **cap_permitted** 表示进程能够使用的权限。
++ **cap_effective** 表示进程真正可以使用的权限
++ **cap_bset** 是 capability bounding set，是系统中所有进程允许保留的权限。如果这个集合中不存在某个权限，那么系统中的所有进程都没有这个权限
++ **cap_ambient** 非 root 用户进程使用 exec 执行一个程序的时候，如何保留权限的问题。当执行 exec 的时候，cap_ambient 会被添加到 cap_permitted 中，同时设置到 cap_effective 中
+
