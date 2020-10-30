@@ -590,7 +590,7 @@ int main(int argc, char *argv[])
 
 
 
-### 3.3 任务结构
+### 3.3 任务
 
 Linux 里面，无论是进程，还是线程，到了内核里面，我们统一都叫任务（Task），由一个统一的结构 task_struct 进行管理。
 
@@ -803,7 +803,7 @@ struct cred {
 #endif
 ```
 
-
+##### 单核CPU
 
 thread_info中有成员变量 task 指向 task_struct， 常用 current_thread_info()->task 来获取 task_struct。
 
@@ -824,3 +824,188 @@ static inline struct thread_info *current_thread_info(void)
 }
 ```
 
+##### 多核CPU
+
+每个 CPU 运行的 task_struct 直接放在 Per CPU 变量里面了。多核情况下，CPU 是同时运行的，但是它们共同使用其他的硬件资源的时候。Per CPU 变量是内核中一种重要的同步机制，Per CPU 变量就是为每个 CPU 构造一个变量的副本，这样多个 CPU 各自操作自己的副本，互不干涉。
+
+```C
+#include <asm/current.h>
+#define current_thread_info() ((struct thread_info *)current)
+#endif
+
+struct task_struct;
+
+DECLARE_PER_CPU(struct task_struct *, current_task);
+static __always_inline struct task_struct *get_current(void)
+{
+  return this_cpu_read_stable(current_task);
+}
+#define current get_current
+```
+
+
+
+### 3.4 调度
+
+#### 进程优先级
+
+在 Linux 里面，进程大概可以分成两种
+
++ 实时进程，也就是需要尽快执行返回结果的那种, 优先级的范围是 0～99
++ 普通进程，大部分的进程其实都是这种, 优先级的范围是 100～139
+
+```C
+int prio, static_prio, normal_prio;
+unsigned int rt_priority;
+```
+
+#### 调度策略
+
+##### 实时调度
+
++ **SCHED_FIFO**：高优先级的进程可以抢占低优先级的进程，而相同优先级的进程，我们遵循先来先得。
++ **SCHED_RR**：采用时间片，相同优先级的任务当用完时间片会被放到队列尾部，以保证公平性，而高优先级的任务也是可以抢占低优先级的任务。
++ **SCHED_DEADLINE**: 按照任务的 deadline 进行调度的。DL 调度器总是选择其 deadline 距离当前时间点最近的那个任务，并调度它执行。
+
+##### 普通调度
+
++ **SCHED_NORMAL** 是普通的进程
++ **SCHED_BATCH** 是后台进程，几乎不需要和前端进行交互
++ **SCHED_IDLE** 是特别空闲的时候才跑的进程
+
+##### Completely Fair Scheduling - 普通调度的一种实现
+
+首先，你需要记录下进程的运行时间。CPU 会提供一个时钟，过一段时间就触发一个时钟中断，这个我们叫 Tick。**CFS 会为每一个进程安排一个虚拟运行时间 vruntime**。如果一个进程在运行，随着时间的增长，也就是一个个 tick 的到来，进程的 vruntime 将不断增大。没有得到执行的进程 vruntime 不变。
+
+```c
+
+/*
+ * Update the current task's runtime statistics.
+ */
+static void update_curr(struct cfs_rq *cfs_rq)
+{
+  struct sched_entity *curr = cfs_rq->curr;
+  u64 now = rq_clock_task(rq_of(cfs_rq));
+  u64 delta_exec;
+......
+  delta_exec = now - curr->exec_start;
+......
+  curr->exec_start = now;
+......
+  curr->sum_exec_runtime += delta_exec;
+......
+  curr->vruntime += calc_delta_fair(delta_exec, curr);
+  update_min_vruntime(cfs_rq);
+......
+}
+
+
+/*
+ * delta /= w
+ */
+static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
+{
+  if (unlikely(se->load.weight != NICE_0_LOAD))
+        /* delta_exec * weight / lw.weight */
+    delta = __calc_delta(delta, NICE_0_LOAD, &se->load);
+  return delta;
+}
+```
+
++ 得到当前的时间，以及这次的时间片开始的时间，两者相减就是这次运行的时间 delta_exec。
++ 做一定的转化才作为虚拟运行时间 vruntime。转化方法如下：虚拟运行时间 **vruntime += 实际运行时间 delta_exec * NICE_0_LOAD/ 权重**
+
+同样的实际运行时间，给高权重的算少了，低权重的算多了
+
+
+
+#### 调度队列/调度实体
+
+看来 CFS 需要一个数据结构来对 vruntime 进行排序。能够平衡查询和更新速度的是树，在这里使用的是红黑树。红黑树的的节点是应该包括 vruntime 的，称为调度实体。
+
+```C
+struct sched_entity {
+  struct load_weight    load;
+  struct rb_node      run_node;
+  struct list_head    group_node;
+  unsigned int      on_rq;
+  u64        exec_start;
+  u64        sum_exec_runtime;
+  u64        vruntime;
+  u64        prev_sum_exec_runtime;
+  u64        nr_migrations;
+  struct sched_statistics    statistics;
+......
+};
+```
+
+![](./images/os-32.png)
+
+CPU 也是这样的，每个 CPU 都有自己的 struct rq 结构，其包括
+
++ 一个实时进程队列 rt_rq 
++ 一个 CFS 运行队列 cfs_rq
+
+在调度时，调度器首先会先去实时进程队列找是否有实时进程需要运行，如果没有才会去 CFS 运行队列找是否有进程需要运行。
+
+```C
+struct rq {
+  /* runqueue lock: */
+  raw_spinlock_t lock;
+  unsigned int nr_running;
+  unsigned long cpu_load[CPU_LOAD_IDX_MAX];
+......
+  struct load_weight load;
+  unsigned long nr_load_updates;
+  u64 nr_switches;
+
+  struct cfs_rq cfs;
+  struct rt_rq rt;
+  struct dl_rq dl;
+......
+  struct task_struct *curr, *idle, *stop;
+......
+};
+```
+
+![](./images/os-33.png)
+
+#### 调度类
+
+```C
+struct sched_class {
+  const struct sched_class *next;
+
+
+  void (*enqueue_task) (struct rq *rq, struct task_struct *p, int flags);
+  void (*dequeue_task) (struct rq *rq, struct task_struct *p, int flags);
+  void (*yield_task) (struct rq *rq);
+  bool (*yield_to_task) (struct rq *rq, struct task_struct *p, bool preempt);
+
+
+  void (*check_preempt_curr) (struct rq *rq, struct task_struct *p, int flags);
+
+
+  struct task_struct * (*pick_next_task) (struct rq *rq,
+            struct task_struct *prev,
+            struct rq_flags *rf);
+  void (*put_prev_task) (struct rq *rq, struct task_struct *p);
+
+
+  void (*set_curr_task) (struct rq *rq);
+  void (*task_tick) (struct rq *rq, struct task_struct *p, int queued);
+  void (*task_fork) (struct task_struct *p);
+  void (*task_dead) (struct task_struct *p);
+
+
+  void (*switched_from) (struct rq *this_rq, struct task_struct *task);
+  void (*switched_to) (struct rq *this_rq, struct task_struct *task);
+  void (*prio_changed) (struct rq *this_rq, struct task_struct *task, int oldprio);
+  unsigned int (*get_rr_interval) (struct rq *rq,
+           struct task_struct *task);
+  void (*update_curr) (struct rq *rq)
+```
+
+**所有的调度类是放在一个链表上的**。调度的时候是从优先级最高的调度类到优先级低的调度类，依次执行。而对于每种调度类，有自己的实现
+
+![](./images/os-34.png)
