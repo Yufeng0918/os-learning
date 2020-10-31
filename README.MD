@@ -1010,3 +1010,295 @@ struct sched_class {
 
 ![](./images/os-34.png)
 
+#### 主动调度
+
+##### 上下文切换
+
+计算主要是 CPU 和内存的合作；网络和存储则多是和外部设备的合作；在操作外部设备的时候，往往需要让出 CPU，**选择调用 schedule() 函数。**
+
+```c
+asmlinkage __visible void __sched schedule(void)
+{
+  struct task_struct *tsk = current;
+
+
+  sched_submit_work(tsk);
+  do {
+    preempt_disable();
+    __schedule(false);
+    sched_preempt_enable_no_resched();
+  } while (need_resched());
+}t
+```
+
+上下文切换主要干两件事情
+
++ switch_mm_irqs_off 一是切换进程空间，也即虚拟内存
++ switch_to 切换寄存器和 CPU 上下文
+
+```C
+
+/*
+ * context_switch - switch to the new MM and the new thread's register state.
+ */
+static __always_inline struct rq *
+context_switch(struct rq *rq, struct task_struct *prev,
+         struct task_struct *next, struct rq_flags *rf)
+{
+  struct mm_struct *mm, *oldmm;
+......
+  mm = next->mm;
+  oldmm = prev->active_mm;
+......
+  switch_mm_irqs_off(oldmm, mm, next);
+......
+  /* Here we just switch the register state and the stack. */
+  switch_to(prev, next, prev);
+  barrier();
+  return finish_task_switch(prev);
+}
+```
+
+switch_to。它就是寄存器和栈的切换，它调用到了 __switch_to_asm。这是一段汇编代码，主要用于栈的切换。
+
++ 对于 32 位操作系统来讲，切换的是栈顶指针 esp。
++ 对于 64 位操作系统来讲，切换的是栈顶指针 rsp。
+
+```assembly
+/*
+ * %rdi: prev task
+ * %rsi: next task
+ */
+ENTRY(__switch_to_asm)
+......
+  /* switch stack */
+  movq  %rsp, TASK_threadsp(%rdi)
+  movq  TASK_threadsp(%rsi), %rsp
+......
+  jmp  __switch_to
+END(__switch_to_asm)
+```
+
+**在 x86 体系结构中，提供了一种以硬件的方式进行进程切换的模式，对于每个进程，x86 希望在内存里面维护一个 TSS（Task State Segment，任务状态段）结构。**有一个特殊的寄存器 TR（Task Register，任务寄存器），指向某个进程的 TSS。
+
+更改 TR 的值，将会触发硬件保存 CPU 所有寄存器的值到当前进程的 TSS 中，然后从新进程的 TSS 中读出所有寄存器值，加载到 CPU 对应的寄存器中
+
+````c
+
+__visible __notrace_funcgraph struct task_struct *
+__switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+{
+  struct thread_struct *prev = &prev_p->thread;
+  struct thread_struct *next = &next_p->thread;
+......
+  int cpu = smp_processor_id();
+  struct tss_struct *tss = &per_cpu(cpu_tss, cpu);
+......
+  load_TLS(next, cpu);
+......
+  this_cpu_write(current_task, next_p);
+
+
+  /* Reload esp0 and ss1.  This changes current_thread_info(). */
+  load_sp0(tss, next);
+......
+  return prev_p;
+}
+````
+
+**Linux 操作系统想了一个办法。还记得在系统初始化的时候，会调用 cpu_init。这里面会给每一个 CPU 关联一个 TSS，然后将 TR 指向这个 TSS**。在 Linux 中，真的参与进程切换的寄存器很少，主要的就是栈顶寄存器。**所谓的进程切换，就是将某个进程的 thread_struct 里面的寄存器的值，写入到 CPU 的 TR 指向的 tss_struct**
+
+```C
+void cpu_init(void)
+{
+  int cpu = smp_processor_id();
+  struct task_struct *curr = current;
+  struct tss_struct *t = &per_cpu(cpu_tss, cpu);
+    ......
+    load_sp0(t, thread);
+  set_tss_desc(cpu, t);
+  load_TR_desc();
+    ......
+}
+
+
+struct tss_struct {
+  /*
+   * The hardware state:
+   */
+  struct x86_hw_tss  x86_tss;
+  unsigned long    io_bitmap[IO_BITMAP_LONGS + 1];
+} 
+```
+
+###### 用户态切换
+
++ 用户栈切换：内存切换
++ 用户栈顶指针切换：pt_regs 恢复
++ 用户指令指针切换：pt_regs 恢复
+
+###### 内核态切换
+
++ 内核栈切换：**current_task指向新的task_struct**
++ 内核栈顶指针切换：sp/rp指向新的TSS
++ 内核指令指针切换：_switch_to_asm(prev, next) 
+
+##### 切换过程
+
+一个进程 A 在用户态是要写一个文件的，写文件的操作用户态没办法完成，就要通过系统调用到达内核态。在这个切换的过程中，用户态的指令指针寄存器是保存在 pt_regs 里面的，到了内核态，就开始沿着写文件的逻辑一步一步执行，结果发现需要等待，于是就调用 __schedule 函数
+
+```c
+switch_to(prev, next, prev);
+barrier();
+return finish_task_switch(prev);
+```
+
+当进程 A 在内核里面执行 switch_to 的时候，内核态的指令指针也是指向这一行的。**但是在 switch_to 里面，将寄存器和栈都切换到成了进程 B 的，唯一没有变的就是指令指针寄存器。**当 switch_to 返回的时候，指令指针寄存器指向了下一条语句 finish_task_switch。
+
+当年 B 进程被别人切换走的时候，也是调用 **\__schedule，也是调用到 switch_to，被切换成为 C 进程的，所以，B 进程当年的下一个指令也是 finish_task_switch**，这就说明指令指针指到这里是没有错的。假设B 就是最前面例子里面调用 tap_do_read 读网卡的进程。它当年调用 **\__schedule 的时候，是从 tap_do_read 这个函数调用进去的。B 进程的内核栈里面放的是 tap_do_read。于是，从 __schedule 返回之后，当然是接着 tap_do_read 运行，**然后在内核运行完毕后，返回用户态。
+
+```C
+#define switch_to(prev, next, last)          \
+do {                  \
+  prepare_switch_to(prev, next);          \
+                  \
+  ((last) = __switch_to_asm((prev), (next)));      \
+} while (0)
+```
+
+A 切换到 B 的时候，运行到 __switch_to_asm 这一行的时候，是在 A 的内核栈上运行的，prev 是 A，next 是 B。但是，A 执行完 __switch_to_asm 之后就被切换走了，当 C 再次切换到 A 的时候，运行到 __switch_to_asm，是从 C 的内核栈运行的。这个时候，prev 是 C，next 是 A，但是 __switch_to_asm 里面切换成为了 A 当时的内核栈。
+
+![](./images/os-35.png)
+
+#### 抢占调度
+
+一个进程执行时间太长了，是时候切换到另一个进程了
+
+##### 抢占准备
+
+###### 时钟中断抢占
+
+计算机里面有一个时钟，会过一段时间触发一次时钟中断，通知操作系统，时间又过去一个时钟周期，这是个很好的方式，可以查看是否是需要抢占的时间点。时钟中断处理函数会调用 scheduler_tick()
+
+```c
+void scheduler_tick(void)
+{
+  int cpu = smp_processor_id();
+  struct rq *rq = cpu_rq(cpu);
+  struct task_struct *curr = rq->curr;
+......
+  curr->sched_class->task_tick(rq, curr, 0);
+  cpu_load_update_active(rq);
+  calc_global_load_tick(rq);
+......
+}
+```
+
+scheduler_tick 调用task_tick， task_tick调用entity_tick
+
+在 entity_tick 里面，update_curr会更新当前进程的 vruntime，然后调用 check_preempt_tick，检查是否是时候被抢占了。
+
+```C
+static void
+check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
+{
+  unsigned long ideal_runtime, delta_exec;
+  struct sched_entity *se;
+  s64 delta;
+
+
+  ideal_runtime = sched_slice(cfs_rq, curr);
+  delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
+  if (delta_exec > ideal_runtime) {
+    resched_curr(rq_of(cfs_rq));
+    return;
+  }
+......
+  se = __pick_first_entity(cfs_rq);
+  delta = curr->vruntime - se->vruntime;
+  if (delta < 0)
+    return;
+  if (delta > ideal_runtime)
+    resched_curr(rq_of(cfs_rq));
+}
+```
+
+如下情况会被抢占
+
++ sum_exec_runtime 指进程总共执行的实际时间，prev_sum_exec_runtime 指上次该进程被调度时已经占用的实际时间。**sum_exec_runtime-prev_sum_exec_runtime 就是这次调度占用实际时间。如果这个时间大于 ideal_runtime，**则应该被抢占了。
++ 通过 __pick_first_entity 取出红黑树中最小的进程。**如果当前进程的 vruntime 大于红黑树中最小的进程的 vruntime，且差值大于 ideal_runtime**
+
+标记一个进程应该被抢占，都是调用 resched_curr，它会调用 set_tsk_need_resched，标记进程应该被抢占，并不真的抢占，而是打上一个标签 TIF_NEED_RESCHED。
+
+###### 唤醒抢占
+
+当一个进程在等待一个 I/O 的时候，会主动放弃 CPU。但是当 I/O 到来的时候，进程往往会被唤醒。这个时候是一个时机。当被唤醒的进程优先级高于 CPU 上的当前进程，就会触发抢占。
+
+```C
+static void ttwu_do_wakeup(struct rq *rq, struct task_struct *p, int wake_flags,
+         struct rq_flags *rf)
+{
+  check_preempt_curr(rq, p, wake_flags);
+  p->state = TASK_RUNNING;
+  trace_sched_wakeup(p);
+```
+
+##### 抢占时机
+
+###### 用户态的抢占时机
+
+64 位的系统调用的链路位 do_syscall_64->syscall_return_slowpath->prepare_exit_to_usermode->exit_to_usermode_loop
+
+```C
+static void exit_to_usermode_loop(struct pt_regs *regs, u32 cached_flags)
+{
+  while (true) {
+    /* We have work to do. */
+    local_irq_enable();
+
+
+    if (cached_flags & _TIF_NEED_RESCHED)
+      schedule();
+......
+  }
+}
+```
+
+exit_to_usermode_loop 函数中，上面打的标记起了作用，如果被打了 _TIF_NEED_RESCHED，调用 schedule 进行调度。**对于用户态的进程来讲，从中断中返回的那个时刻，也是一个被抢占的时机。**
+
+###### 内核态的抢占时机
+
+在内核态的执行中，有的操作是不能被中断的，所以在进行这些操作之前，总是先调用 preempt_disable() 关闭抢占，当再次打开的时候，就是一次内核态代码被抢占的机会。
+
+**preempt_enable()** 会调用 preempt_count_dec_and_test()，**判断 preempt_count 和 TIF_NEED_RESCHED 是否可以被抢占**。如果可以，就调用 preempt_schedule->preempt_schedule_common->__schedule 进行调度。
+
+```C
+
+#define preempt_enable() \
+do { \
+  if (unlikely(preempt_count_dec_and_test())) \
+    __preempt_schedule(); \
+} while (0)
+
+
+#define preempt_count_dec_and_test() \
+  ({ preempt_count_sub(1); should_resched(0); })
+
+static __always_inline bool should_resched(int preempt_offset)
+{
+  return unlikely(preempt_count() == preempt_offset &&
+      tif_need_resched());
+}
+
+#define tif_need_resched() test_thread_flag(TIF_NEED_RESCHED)
+
+static void __sched notrace preempt_schedule_common(void)
+{
+  do {
+......
+    __schedule(true);
+......
+  } while (need_resched())
+```
+
+![](./images/os-35.png)
