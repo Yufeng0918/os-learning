@@ -624,9 +624,9 @@ unsigned int      sas_ss_flags;
 ![](./images/os-26.png)
 
 + **TASK_RUNNING**： 并不是说进程正在运行，而是表示进程在时刻准备运行的状态
-+ **TASK_INTERRUPTIBLE**：可中断的睡眠状态，信号可以唤醒进程
-+ **TASK_UNINTERRUPTIBLE**：不可中断的睡眠状态，线程不能被唤醒
-+ **TASK_KILLABLE**：可以终止的新睡眠状态，可以响应致命信号
++ **TASK_INTERRUPTIBLE**：可中断的**睡眠状态**，信号可以唤醒进程
++ **TASK_UNINTERRUPTIBLE**：不可中断的**睡眠状态**，线程不能被唤醒
++ **TASK_KILLABLE**：可以终止的新**睡眠状态**，可以响应致命信号
 + **TASK_STOPPED**：进程接收到 SIGSTOP、SIGTTIN、SIGTSTP 或者 SIGTTOU 信号之后进入该状态
 + **TASK_TRACED**：进程被 debugger 等进程监视，进程执行被调试程序所停止
 + **EXIT_ZOMBIE**：进程要结束
@@ -672,7 +672,7 @@ struct list_head sibling;       /* linkage in my parent's children list */
 
 + parent 指向其父进程。当它终止时，必须向它的父进程发送信号
 + children 表示链表的头部。链表中的所有元素都是它的子进程
-+ sibling 用于把当前进程插入到兄弟链表中。
++ sibling 用于把当前进程插入到兄弟链表中
 
 ![](./images/os-27.png)
 
@@ -802,8 +802,6 @@ struct cred {
 # define TOP_OF_KERNEL_STACK_PADDING 0
 #endif
 ```
-
-
 
 thread_info中有成员变量 task 指向 task_struct， 常用 current_thread_info()->task 来获取 task_struct。
 
