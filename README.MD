@@ -266,7 +266,7 @@ rest_init 的第一工作是用 kernel_thread(kernel_init, NULL, CLONE_FS) 创�
 
 ### 3.1 进程
 
-#### 进程代码
+#### ELF二进制格式
 
 process.c
 
@@ -312,7 +312,7 @@ int main () {
 
 
 
-#### ELF 程序的二进制格式
+#### 
 
 源代码被编译成二进制文件，这个格式称为 ELF（Executeable and Linkable Format，可执行与可链接格式）。
 
@@ -325,8 +325,8 @@ int main () {
 ELF 文件的头是用于描述整个文件的
 
 + .text：放编译好的二进制可执行代码
-+ .data：已经初始化好的全局变量
 + .rodata：只读数据，例如字符串常量、const 的变量
++ .data：已经初始化好的全局变量
 + .bss：未初始化全局变量，运行时会置 0
 + .symtab：符号表，记录的则是函数和变量
 + .strtab：字符串表、字符串常量和变量名
@@ -339,12 +339,14 @@ ELF 文件的头是用于描述整个文件的
 
 ![](./images/os-19.png)
 
-把process.o创建成静态链接库。**静态链接库一旦链接进去，代码和变量的 section 都合并了**，因而程序运行的时候，就不依赖于这个库是否存在
+把process.o创建成静态链接库。**静态链接库会代码和变量的 section 都合并了**，因而程序运行的时候不依赖于这个库是否存在
 
 ```shell
 ar cr libstaticprocess.a process.o
 gcc -o staticcreateprocess createprocess.o -L. -libstaticprocess
 ```
+
+
 
 ##### 共享对象文件 - 动态链接
 
@@ -369,7 +371,7 @@ gcc -o dynamiccreateprocess createprocess.o -L. -ldynamicprocess
 
 
 
-#### 内核数据结构
+##### 内核数据结构
 
 在内核中，linux_binfmt数据结构定义加载二进制文件的方法
 
@@ -400,16 +402,89 @@ static struct linux_binfmt elf_format = {
 
 ![](./images/os-20.png)
 
-#### 总结
-
 ![](./images/os-21.png)
+
+#### Fork
+
+```c
+long _do_fork(unsigned long clone_flags,
+        unsigned long stack_start,
+        unsigned long stack_size,
+        int __user *parent_tidptr,
+        int __user *child_tidptr,
+        unsigned long tls)
+{
+  struct task_struct *p;
+  int trace = 0;
+  long nr;
+  p = copy_process(clone_flags, stack_start, stack_size,
+       child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
+    wake_up_new_task(p);
+
+  } 
+```
+
+
+
+##### 创建
+
+###### dup_task_struct
+
++ 创建一个 task_struct 结构
++ 创建内核栈，分配一个THREAD_SIZE 的内存空间
++ 复制task_struct
++ 设置thread_info
+
+###### copy_creds
+
++ 创建一个新的 struct cred 结构
+
+###### 重设统计量
+
++ utime
++ Start_time
+
+###### sched_fork
+
++ 初始化 sched_entity，将exec_start、sum_exec_runtime、prev_sum_exec_runtime、vruntime 都设为 0
++ 设置进程的状态 p->state = TASK_NEW
++ 初始化优先级
++ 设置调度类
++ 调用调度类的 task_fork 函数, 记当前运行的进程 TIF_NEED_RESCHED
+
+###### copy_files/copy_fs
+
++ 创建 files_struct, 拷贝文件描述符数组 fdtable
++ 创建 fs_struct, 复制一个进程的目录信息
+
+###### copy_singhand
+
++ 创建 sighand_struct， 维护信号处理函数
+
+###### copy_mm
+
++ 创建mm_struct 结构
+
+###### 分配 pid，设置 tid，group_leader
+
+##### 唤醒
+
+将进程的状态设置为 TASK_RUNNING
+
+调用 enqueue_task
+
++ 更新运行的统计量
++ 将 sched_entity 加入到红黑树
+
+调用check_preempt_wakeup， 在fork系统调用返回时抢占
+
+![](./images/os-36.jpeg)
 
 ### 3.2 线程
 
-#### 创建线程
+#### 生命周期
 
 ```c
-
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -418,7 +493,6 @@ static struct linux_binfmt elf_format = {
 
 void *downloadfile(void *filename)
 {
-   printf("I am downloading the file %s!\n", (char *)filename);
    sleep(10);
    long downloadtime = rand()%100;
    printf("I finish downloading the file within %d minutes!\n", downloadtime);
@@ -427,12 +501,14 @@ void *downloadfile(void *filename)
 
 int main(int argc, char *argv[])
 {
-   char files[NUM_OF_TASKS][20]={"file1.avi","file2.rmvb","file3.mp4","file4.wmv","file5.flv"};
-   pthread_t threads[NUM_OF_TASKS];
+   char files[NUM_OF_TASKS][20]={"file1.avi","file2.rmvb","file3.mp4","file4.wmv"};
+   
    int rc;
    int t;
    int downloadtime;
-	 
+ 
+   // 声明线程
+   pthread_t threads[NUM_OF_TASKS];
    // 声明线程属性 
    pthread_attr_t thread_attr;
    // 初始化线程属性
@@ -442,11 +518,8 @@ int main(int argc, char *argv[])
    for(t=0;t<NUM_OF_TASKS;t++){
      printf("creating thread %d, please help me to download %s\n", t, files[t]);
      
-     // 创建线程
-     // 第一个参数：线程对象
-     // 第二个参数：线程属性
-     // 第三个参数：线程执行的方法
-     // 第四个参数：线程执行的方法的参数
+     // 创建线程参数
+     // 线程对象，线程属性，线程执行的方法， 线程执行的方法的参数
      rc = pthread_create(&threads[t], &thread_attr, downloadfile, (void *)files[t]);
      if (rc){
        printf("ERROR; return code from pthread_create() is %d\n", rc);
@@ -455,12 +528,10 @@ int main(int argc, char *argv[])
    }
 
    pthread_attr_destroy(&thread_attr);
-
    for(t=0;t<NUM_OF_TASKS;t++){
      pthread_join(threads[t],(void**)&downloadtime);
      printf("Thread %d downloads the file %s in %d minutes.\n",t,files[t],downloadtime);
    }
-
    pthread_exit(NULL);
 }
 ```
@@ -474,7 +545,6 @@ int main(int argc, char *argv[])
 + 线程私有数据（Thread Specific Data）: key 一旦被创建，所有线程都可以访问它，**但各线程可根据自己的需要往 key 中填入不同的值**，这就相当于提供了一个同名而不同值的全局变量。
 
 ```C
-
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void*))
 int pthread_setspecific(pthread_key_t key, const void *value)
 void *pthread_getspecific(pthread_key_t key)
@@ -584,9 +654,66 @@ int main(int argc, char *argv[])
 
 ![](./images/os-24.png)
 
-#### 总结
-
 ![](./images/os-25.png)
+
+
+
+#### 创建
+
+##### 用户态创建
+
+创建pthread 结构， 调用ALLOCATE_STACK
+
++ 线程栈是在进程的堆里面创建的， 申请一块内存空间，如果没有，就调用__mmap 创建一块新的
++ 线程栈也是自顶向下生长的，还记得每个线程要有一个 pthread 结构
++ 填充pthread 这个结构里面的成员变量 stackblock、stackblock_size、guardsize、specific等全局变量
++ 线程栈放到 stack_used 链表中，其实管理线程栈总共有两个链表，一个是 stack_used，也就是这个栈正被使用；另一个是 stack_cache，缓存起来暂时不适用的线程
+
+##### 内核态创建
+
+###### 标志位设定
+
++ copy_files： files_struct 引用计数加一
++ copy_fs：fs_struct 的用户数加一
++ copy_sighand： sighand_struct 引用计数加一
++ copy_signal：直接返回
++ copy_mm：直接指向了原来的 mm_struc
+
+###### 设置亲缘关系
+
++ 设置group_leader 和 tgid
+
+###### 信号的处理
+
++ 整个进程里的所有线程共享一个 shared_pending
+
+##### 用户态执行
+
+回到用户态执行start_thread
+
+```C
+#define START_THREAD_DEFN \
+  static int __attribute__ ((noreturn)) start_thread (void *arg)
+
+START_THREAD_DEFN
+{
+    struct pthread *pd = START_THREAD_SELF;
+    /* Run the code the user provided.  */
+    THREAD_SETMEM (pd, result, pd->start_routine (pd->arg));
+    /* Call destructors for the thread_local TLS variables.  */
+    /* Run the destructor for the thread-local data.  */
+    __nptl_deallocate_tsd ();
+    if (__glibc_unlikely (atomic_decrement_and_test (&__nptl_nthreads)))
+        /* This was the last thread.  */
+        exit (0);
+    __free_tcb (pd);
+    __exit_thread ();
+}
+```
+
+线程执行完后调用 __deallocate_stack 来释放整个线程栈，这个线程栈要从当前使用线程栈的列表 stack_used 中拿下来，放到缓存的线程栈列表 stack_cache 中。
+
+![](./images/os-37.png)
 
 
 
@@ -1168,7 +1295,7 @@ do {                  \
 
 A 切换到 B 的时候，运行到 __switch_to_asm 这一行的时候，是在 A 的内核栈上运行的，prev 是 A，next 是 B。但是，A 执行完 __switch_to_asm 之后就被切换走了，当 C 再次切换到 A 的时候，运行到 __switch_to_asm，是从 C 的内核栈运行的。这个时候，prev 是 C，next 是 A，但是 __switch_to_asm 里面切换成为了 A 当时的内核栈。
 
-![](./images/os-35.png)
+
 
 #### 抢占调度
 
@@ -1302,3 +1429,10 @@ static void __sched notrace preempt_schedule_common(void)
 ```
 
 ![](./images/os-35.png)
+
+
+
+
+
+
+
